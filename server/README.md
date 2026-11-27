@@ -21,7 +21,28 @@ py -3 -m venv .venv
 .venv\Scripts\python app.py
 ```
 
-Al iniciar, la ventana muestra la lista de cámaras guardadas sin abrir video. Tocá **Agregar cámara** para ingresar su nombre y URL RTSP; cada cámara tiene su propia casilla **IA**. Al agregar, quitar o cambiar la IA aparece un borrador: **Aplicar cambios** lo guarda y reinicia el servicio, y **Cancelar** lo descarta. **Probar** abre una ventana separada para elegir una cámara y ver su stream; el servidor también envía ese video al cliente. Cerrar la ventana de prueba no interrumpe la transmisión al cliente. La configuración aplicada queda en `cameras.json`. Si la URL contiene credenciales, se guarda localmente en texto plano, así que no compartas ese archivo.
+Al iniciar, la ventana muestra la lista de cámaras guardadas sin abrir video. Tocá **Agregar cámara** para ingresar su nombre y URL RTSP; cada cámara tiene su propia casilla **IA**. Una cámara seleccionada se puede modificar con **Editar**, incluso para cambiar su IP, sus credenciales o la ruta del stream, sin eliminarla y volverla a crear.
+
+Dentro de **Agregar cámara**, el botón **Buscar automáticamente en la red** revisa en segundo plano las direcciones de la subred local `/24` y muestra los equipos que aceptan conexiones TCP en el puerto RTSP 554. Al elegir una IP, VigiWork solicita el usuario, la contraseña y la ruta del stream, y construye automáticamente la URL completa con el formato `rtsp://usuario:contraseña@IP:554/ruta`. La ruta ofrece valores habituales de distintos fabricantes y continúa siendo editable porque no forma parte del descubrimiento del puerto. La búsqueda no prueba contraseñas ni examina direcciones fuera de esa subred.
+
+Al agregar, editar, quitar o cambiar la IA aparece un borrador: **Aplicar cambios** lo guarda y reinicia el servicio, y **Cancelar** lo descarta. **Probar** abre una ventana separada para elegir una cámara y ver su stream; el servidor también envía ese video al cliente. Cerrar la ventana de prueba no interrumpe la transmisión al cliente. La configuración aplicada queda en `cameras.json`. Si la URL contiene credenciales, se guarda localmente en texto plano, así que no compartas ese archivo.
+
+## Alertas por correo
+
+El botón **Configurar alertas por correo** guarda en la configuración local del servidor una cuenta Gmail, una contraseña de aplicación SMTP y el destinatario. Cuando la IA mantiene al menos una detección `SIN CASCO` durante cinco segundos continuos, el servidor envía un correo con la cámara, la fecha, la hora y una captura JPEG. Cada episodio genera un solo aviso; una nueva detección queda sujeta a un enfriamiento de cinco minutos para evitar correos repetidos. La captura y el envío SMTP se ejecutan fuera del hilo de video.
+
+También se puede configurar sin la interfaz mediante variables de entorno:
+
+```text
+VIGIWORK_SMTP_USER=cuenta@gmail.com
+VIGIWORK_SMTP_PASSWORD=contraseña_de_aplicación
+VIGIWORK_ALERT_RECIPIENT=destino@example.com
+VIGIWORK_SMTP_HOST=smtp.gmail.com
+VIGIWORK_SMTP_PORT=465
+VIGIWORK_SMTP_SSL=1
+```
+
+Las variables opcionales `VIGIWORK_ALERT_AFTER_SECONDS` y `VIGIWORK_ALERT_COOLDOWN_SECONDS` permiten cambiar los valores predeterminados de 5 y 300 segundos. No guardes contraseñas reales en el repositorio. Si la IA está apagada para una cámara, esa cámara no genera alertas.
 
 ## GPU y detección
 

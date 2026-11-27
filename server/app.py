@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import json
 import re
-import socket
 import sys
 import threading
 import time
@@ -21,7 +20,7 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QDialog, QDialogButtonBox, QFormLayout, QMessageBox, QPushButton,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QVBoxLayout, QWidget,
+    QSpinBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QVBoxLayout, QWidget,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +28,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from shared.theme import APP_STYLESHEET, app_icon, brand_header, scrollable
+from camera_discovery import (
+    DEFAULT_RTSP_PORT,
+    build_rtsp_url,
+    discover_rtsp_hosts,
+    local_ipv4,
+)
+from email_alerts import (
+    EmailAlertSender,
+    EmailSettings,
+    HelmetAlertTracker,
+    alert_timing_from_environment,
+)
 from helmet_detector import AsyncHelmetDetector, draw_helmets, load_detector
 from video_server import VideoHub
 
@@ -152,21 +163,32 @@ class CloudflareTunnelWorker(QObject):
 
 
 class AddCameraDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        title: str = "Agregar cámara",
+        name: str = "",
+        url: str = "",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Agregar cámara")
+        self.setWindowTitle(title)
         self.setWindowIcon(app_icon())
         self.setStyleSheet(APP_STYLESHEET)
         root = QVBoxLayout(self)
-        root.addWidget(brand_header("Agregar cámara", "Guardá una cámara RTSP en el servidor"))
+        subtitle = "Modificá la cámara RTSP guardada" if name or url else "Guardá una cámara RTSP en el servidor"
+        root.addWidget(brand_header(title, subtitle))
         form = QFormLayout()
         root.addLayout(form)
-        self.name = QLineEdit()
+        self.name = QLineEdit(name)
         self.name.setPlaceholderText("Ej. Entrada principal")
-        self.url = QLineEdit()
+        self.url = QLineEdit(url)
         self.url.setPlaceholderText("rtsp://usuario:contraseña@192.168.1.154:554/ruta")
         form.addRow("Nombre", self.name)
         form.addRow("URL RTSP", self.url)
+        self.discover_button = QPushButton("Buscar automáticamente en la red")
+        self.discover_button.clicked.connect(self._discover_camera)
+        form.addRow("", self.discover_button)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -179,6 +201,270 @@ class AddCameraDialog(QDialog):
             "name": self.name.text().strip(),
             "url": self.url.text().strip(),
         }
+
+    def _discover_camera(self) -> None:
+        address = local_ipv4()
+        if address == "127.0.0.1":
+            QMessageBox.warning(
+                self,
+                "Red no disponible",
+                "No pude determinar la dirección de la red local del servidor.",
+            )
+            return
+        discovery = CameraDiscoveryDialog(address, self)
+        if discovery.exec() != QDialog.DialogCode.Accepted or not discovery.selected_ip:
+            return
+        credentials = DiscoveredCameraDialog(discovery.selected_ip, self)
+        if credentials.exec() != QDialog.DialogCode.Accepted:
+            return
+        camera = credentials.camera()
+        self.name.setText(camera["name"])
+        self.url.setText(camera["url"])
+
+
+class NetworkScanWorker(QObject):
+    found = Signal(str)
+    finished = Signal(list, str)
+
+    def __init__(self, local_ip: str):
+        super().__init__()
+        self.local_ip = local_ip
+        self.stopping = threading.Event()
+
+    def stop(self) -> None:
+        self.stopping.set()
+
+    def run(self) -> None:
+        try:
+            hosts = discover_rtsp_hosts(
+                self.local_ip,
+                stopping=self.stopping,
+                on_found=self.found.emit,
+            )
+        except Exception as exc:
+            self.finished.emit([], str(exc))
+        else:
+            self.finished.emit(hosts, "")
+
+
+class CameraDiscoveryDialog(QDialog):
+    def __init__(self, local_ip: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Buscar cámaras en la red")
+        self.setWindowIcon(app_icon())
+        self.setStyleSheet(APP_STYLESHEET)
+        self.resize(560, 420)
+        self.selected_ip = ""
+        root = QVBoxLayout(self)
+        root.addWidget(brand_header(
+            "Cámaras disponibles",
+            f"Buscando equipos con el puerto RTSP {DEFAULT_RTSP_PORT} abierto cerca de {local_ip}",
+        ))
+        self.status = QLabel("Escaneando la red local…")
+        self.status.setObjectName("status")
+        self.status.setWordWrap(True)
+        root.addWidget(self.status)
+        self.results = QTreeWidget()
+        self.results.setColumnCount(2)
+        self.results.setHeaderLabels(["Dirección IP", "Puerto"])
+        self.results.setRootIsDecorated(False)
+        self.results.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.results.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.results.itemSelectionChanged.connect(self._selection_changed)
+        self.results.itemDoubleClicked.connect(lambda _item, _column: self._accept_selected())
+        root.addWidget(self.results, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.use_button = buttons.addButton("Usar cámara", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.use_button.setEnabled(False)
+        self.use_button.clicked.connect(self._accept_selected)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.scan_thread = QThread(self)
+        self.scan_worker = NetworkScanWorker(local_ip)
+        self.scan_worker.moveToThread(self.scan_thread)
+        self.scan_thread.started.connect(self.scan_worker.run)
+        self.scan_worker.found.connect(self._host_found)
+        self.scan_worker.finished.connect(self._scan_finished)
+        self.scan_worker.finished.connect(self.scan_thread.quit)
+        self.scan_worker.finished.connect(self.scan_worker.deleteLater)
+        self.scan_thread.start()
+
+    def _host_found(self, address: str) -> None:
+        item = QTreeWidgetItem([address, str(DEFAULT_RTSP_PORT)])
+        item.setData(0, Qt.ItemDataRole.UserRole, address)
+        self.results.addTopLevelItem(item)
+        if self.results.topLevelItemCount() == 1:
+            self.results.setCurrentItem(item)
+
+    def _scan_finished(self, hosts: list[str], error: str) -> None:
+        if error:
+            self.status.setText(f"No se pudo completar la búsqueda: {error}")
+        elif hosts:
+            self.status.setText(
+                f"Se encontraron {len(hosts)} candidato(s). Elegí la cámara que querés agregar."
+            )
+        else:
+            self.status.setText(
+                "No se encontraron equipos con el puerto 554 abierto en la red local."
+            )
+
+    def _selection_changed(self) -> None:
+        self.use_button.setEnabled(self.results.currentItem() is not None)
+
+    def _accept_selected(self) -> None:
+        item = self.results.currentItem()
+        if item is None:
+            return
+        self.selected_ip = str(item.data(0, Qt.ItemDataRole.UserRole))
+        self._stop_scan()
+        self.accept()
+
+    def reject(self) -> None:
+        self._stop_scan()
+        super().reject()
+
+    def _stop_scan(self) -> None:
+        if self.scan_thread.isRunning():
+            self.scan_worker.stop()
+            self.scan_thread.quit()
+            self.scan_thread.wait(1500)
+
+
+class DiscoveredCameraDialog(QDialog):
+    def __init__(self, address: str, parent=None):
+        super().__init__(parent)
+        self.address = address
+        self.setWindowTitle("Completar cámara encontrada")
+        self.setWindowIcon(app_icon())
+        self.setStyleSheet(APP_STYLESHEET)
+        self.resize(650, 430)
+        root = QVBoxLayout(self)
+        root.addWidget(brand_header(
+            "Configurar cámara encontrada",
+            f"Completá el acceso para la cámara {address}; VigiWork armará la URL RTSP",
+        ))
+        form = QFormLayout()
+        root.addLayout(form)
+        self.name = QLineEdit(f"Cámara {address}")
+        self.ip = QLineEdit(address)
+        self.ip.setReadOnly(True)
+        self.port = QSpinBox()
+        self.port.setRange(1, 65535)
+        self.port.setValue(DEFAULT_RTSP_PORT)
+        self.username = QLineEdit()
+        self.username.setPlaceholderText("Usuario configurado en la cámara")
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("Contraseña de la cámara")
+        self.path = QComboBox()
+        self.path.setEditable(True)
+        self.path.addItems([
+            "/",
+            "/Streaming/Channels/101",
+            "/cam/realmonitor?channel=1&subtype=0",
+            "/live/ch00_0",
+            "/stream1",
+        ])
+        self.path.setCurrentText("/")
+        self.url_preview = QLineEdit()
+        self.url_preview.setReadOnly(True)
+        form.addRow("Nombre", self.name)
+        form.addRow("Dirección IP", self.ip)
+        form.addRow("Puerto RTSP", self.port)
+        form.addRow("Usuario", self.username)
+        form.addRow("Contraseña", self.password)
+        form.addRow("Ruta del stream", self.path)
+        form.addRow("URL generada", self.url_preview)
+        help_label = QLabel(
+            "La ruta depende del fabricante. Probá primero «/»; también podés elegir una ruta "
+            "habitual de la lista sin tener que editar la URL completa."
+        )
+        help_label.setObjectName("subtle")
+        help_label.setWordWrap(True)
+        root.addWidget(help_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.username.textChanged.connect(self._update_url)
+        self.password.textChanged.connect(self._update_url)
+        self.path.currentTextChanged.connect(self._update_url)
+        self.port.valueChanged.connect(self._update_url)
+        self._update_url()
+
+    def _update_url(self, _value=None) -> None:
+        self.url_preview.setText(build_rtsp_url(
+            self.address,
+            self.username.text(),
+            self.password.text(),
+            port=self.port.value(),
+            path=self.path.currentText(),
+        ))
+
+    def accept(self) -> None:
+        if not self.name.text().strip() or not self.username.text().strip() or not self.password.text():
+            QMessageBox.warning(
+                self,
+                "Faltan datos",
+                "Completá el nombre, el usuario y la contraseña de la cámara.",
+            )
+            return
+        super().accept()
+
+    def camera(self) -> dict[str, str]:
+        return {
+            "name": self.name.text().strip(),
+            "url": self.url_preview.text().strip(),
+        }
+
+
+class EmailSettingsDialog(QDialog):
+    def __init__(self, current: EmailSettings | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configurar alertas por correo")
+        self.setWindowIcon(app_icon())
+        self.setStyleSheet(APP_STYLESHEET)
+        root = QVBoxLayout(self)
+        root.addWidget(brand_header(
+            "Alertas por correo",
+            "El servidor enviará una captura tras cinco segundos continuos sin casco",
+        ))
+        form = QFormLayout()
+        root.addLayout(form)
+        self.username = QLineEdit(current.username if current else "")
+        self.username.setPlaceholderText("cuenta@gmail.com")
+        self.password = QLineEdit(current.password if current else "")
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("Contraseña de aplicación")
+        self.recipient = QLineEdit(current.recipient if current else "")
+        self.recipient.setPlaceholderText("Destino; por defecto, la misma cuenta")
+        form.addRow("Cuenta Gmail", self.username)
+        form.addRow("Contraseña SMTP", self.password)
+        form.addRow("Enviar alertas a", self.recipient)
+        help_label = QLabel(
+            "La contraseña se guarda solamente en la configuración local de este servidor. "
+            "Usá una contraseña de aplicación de Google, no la contraseña principal."
+        )
+        help_label.setObjectName("subtle")
+        help_label.setWordWrap(True)
+        root.addWidget(help_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def email_settings(self) -> EmailSettings | None:
+        username = self.username.text().strip()
+        password = self.password.text().replace(" ", "").strip()
+        recipient = self.recipient.text().strip() or username
+        if not username or not password or not recipient:
+            return None
+        return EmailSettings("smtp.gmail.com", 465, username, password, recipient, True)
 
 
 class CameraPreviewDialog(QDialog):
@@ -336,12 +622,16 @@ class StreamWorker(QObject):
         ai_enabled: bool = True,
         preview_enabled: bool = False,
         performance_level: int = 0,
+        camera_name: str = "Cámara",
+        email_settings: EmailSettings | None = None,
     ):
         super().__init__()
         self.url = url
         self.video_hub = video_hub
         self.ai_enabled = ai_enabled
         self.preview_enabled = preview_enabled
+        self.camera_name = camera_name
+        self.email_settings = email_settings
         self._performance_level = performance_level if performance_level in PROFILE_UTILIZATION else 0
         self._performance_lock = threading.Lock()
         self._stop = threading.Event()
@@ -395,6 +685,9 @@ class StreamWorker(QObject):
     def run(self) -> None:
         async_detector: AsyncHelmetDetector | None = None
         stream_publisher: AsyncStreamPublisher | None = None
+        alert_sender: EmailAlertSender | None = None
+        alert_after, alert_cooldown = alert_timing_from_environment()
+        alert_tracker = HelmetAlertTracker(alert_after, alert_cooldown)
         try:
             stream_publisher = AsyncStreamPublisher(self.video_hub)
             detector = None
@@ -402,6 +695,13 @@ class StreamWorker(QObject):
                 self.status.emit("Cargando detector de cascos…", "working")
                 detector = load_detector()
                 async_detector = AsyncHelmetDetector(detector, AI_MAX_FPS)
+                if self.email_settings is not None:
+                    alert_sender = EmailAlertSender(
+                        self.email_settings,
+                        lambda message, succeeded: self.status.emit(
+                            message, "live" if succeeded else "error"
+                        ),
+                    )
             if self._stop.is_set():
                 return
             backend = detector.backend if detector is not None else "IA apagada"
@@ -413,6 +713,7 @@ class StreamWorker(QObject):
                     self.capture = self._open_camera()
                     if async_detector is not None:
                         async_detector.clear()
+                    alert_tracker.update(False)
                     stream_publisher.clear()
                     connected_at = time.monotonic()
                     self.status.emit(f"En vivo · {backend}", "live")
@@ -439,6 +740,8 @@ class StreamWorker(QObject):
                                 detector = None
                                 helmets = []
                             helmet_count, no_helmet_count = draw_helmets(frame, helmets)
+                            if alert_tracker.update(no_helmet_count > 0, now) and alert_sender:
+                                alert_sender.submit(self.camera_name, frame)
                             if async_detector is not None and async_detector.backend != backend:
                                 backend = async_detector.backend
                         else:
@@ -506,6 +809,8 @@ class StreamWorker(QObject):
                 async_detector.stop()
             if stream_publisher is not None:
                 stream_publisher.stop()
+            if alert_sender is not None:
+                alert_sender.stop()
             self._release_capture()
             self.video_hub.clear()
             self.finished.emit()
@@ -526,6 +831,7 @@ class MainWindow(QMainWindow):
         self._applied_cameras: list[dict[str, object]] = []
         self._has_pending_changes = False
         self.settings = QSettings("VigiWork", "VigiWorkServer")
+        self.email_settings = self._load_email_settings()
         try:
             saved_level = int(self.settings.value("performance/level", 0))
         except (TypeError, ValueError):
@@ -569,6 +875,10 @@ class MainWindow(QMainWindow):
         self.save_camera_button = QPushButton("Agregar cámara")
         self.save_camera_button.clicked.connect(self.save_camera)
         camera_row.addWidget(self.save_camera_button)
+        self.edit_camera_button = QPushButton("Editar")
+        self.edit_camera_button.setEnabled(False)
+        self.edit_camera_button.clicked.connect(self.edit_camera)
+        camera_row.addWidget(self.edit_camera_button)
         self.remove_camera_button = QPushButton("Quitar")
         self.remove_camera_button.setObjectName("danger")
         self.remove_camera_button.clicked.connect(self.remove_camera)
@@ -617,6 +927,17 @@ class MainWindow(QMainWindow):
         self.performance_help.setObjectName("subtle")
         self.performance_help.setWordWrap(True)
         layout.addWidget(self.performance_help)
+
+        alert_row = QHBoxLayout()
+        self.email_settings_button = QPushButton("Configurar alertas por correo")
+        self.email_settings_button.clicked.connect(self.configure_email_alerts)
+        alert_row.addWidget(self.email_settings_button)
+        self.email_settings_label = QLabel(
+            "Alertas activas" if self.email_settings else "Alertas sin configurar"
+        )
+        self.email_settings_label.setObjectName("subtle")
+        alert_row.addWidget(self.email_settings_label, 1)
+        layout.addLayout(alert_row)
 
         server_row = QHBoxLayout()
         self.server_button = QPushButton("Iniciar servidor")
@@ -687,7 +1008,11 @@ class MainWindow(QMainWindow):
             return
         self._set_status("Preparando la cámara y el detector…")
         thread = QThread(self)
-        ai_enabled = bool(camera.get("ai_enabled", True)) if camera else item.checkState(1) == Qt.CheckState.Checked
+        selected_camera = camera or next(
+            (entry for entry in self._cameras if entry["url"] == url),
+            None,
+        )
+        ai_enabled = bool(selected_camera.get("ai_enabled", True)) if selected_camera else False
         preview_enabled = bool(self.preview_window and self.preview_window.isVisible())
         worker = StreamWorker(
             str(url),
@@ -695,6 +1020,8 @@ class MainWindow(QMainWindow):
             ai_enabled,
             preview_enabled,
             self.performance_level,
+            str(selected_camera.get("name", "Cámara")) if selected_camera else "Cámara",
+            self.email_settings,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -839,7 +1166,9 @@ class MainWindow(QMainWindow):
                 self.connect_camera(selected_camera)
 
     def _selection_changed(self) -> None:
-        self.remove_camera_button.setEnabled(self.camera_list.currentItem() is not None)
+        has_selection = self.camera_list.currentItem() is not None
+        self.edit_camera_button.setEnabled(has_selection)
+        self.remove_camera_button.setEnabled(has_selection)
 
     def _camera_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if column != 1:
@@ -957,14 +1286,43 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _local_ip() -> str:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            probe.connect(("192.0.2.1", 80))
-            return probe.getsockname()[0]
-        except OSError:
-            return "127.0.0.1"
-        finally:
-            probe.close()
+        return local_ipv4()
+
+    def _load_email_settings(self) -> EmailSettings | None:
+        environment_settings = EmailSettings.from_environment()
+        if environment_settings is not None:
+            return environment_settings
+        username = str(self.settings.value("smtp/username", "")).strip()
+        password = str(self.settings.value("smtp/password", "")).replace(" ", "").strip()
+        recipient = str(self.settings.value("smtp/recipient", username)).strip()
+        if not username or not password or not recipient:
+            return None
+        return EmailSettings("smtp.gmail.com", 465, username, password, recipient, True)
+
+    def configure_email_alerts(self) -> None:
+        dialog = EmailSettingsDialog(self.email_settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = dialog.email_settings()
+        if settings is None:
+            QMessageBox.warning(
+                self,
+                "Faltan datos",
+                "Completá la cuenta, la contraseña SMTP y el destinatario.",
+            )
+            return
+        self.settings.setValue("smtp/username", settings.username)
+        self.settings.setValue("smtp/password", settings.password)
+        self.settings.setValue("smtp/recipient", settings.recipient)
+        self.settings.sync()
+        self.email_settings = settings
+        self.email_settings_label.setText(f"Alertas activas · destino: {settings.recipient}")
+        if self.worker is not None:
+            self._set_status(
+                "Alertas configuradas. La nueva configuración se usará al volver a conectar la cámara."
+            )
+        else:
+            self._set_status("Alertas por correo configuradas en este servidor.")
 
     def _load_cameras(self) -> None:
         try:
@@ -1055,6 +1413,50 @@ class MainWindow(QMainWindow):
         self._refresh_camera_list(selected)
         self._update_pending_changes()
         self._set_status(f"Cámara «{record['name']}» agregada al borrador; aplicá los cambios para usarla.")
+
+    def edit_camera(self) -> None:
+        index = self.camera_list.indexOfTopLevelItem(self.camera_list.currentItem())
+        if not 0 <= index < len(self._cameras):
+            return
+        original = self._cameras[index]
+        dialog = AddCameraDialog(
+            self,
+            title="Editar cámara",
+            name=str(original["name"]),
+            url=str(original["url"]),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        record = dialog.camera()
+        if not record["name"] or not re.match(r"^rtsps?://", record["url"], re.I):
+            QMessageBox.warning(
+                self,
+                "Faltan datos",
+                "Completá el nombre y una URL que empiece con rtsp:// o rtsps://.",
+            )
+            return
+        duplicate = next(
+            (
+                position
+                for position, camera in enumerate(self._cameras)
+                if position != index and camera["url"] == record["url"]
+            ),
+            None,
+        )
+        if duplicate is not None:
+            QMessageBox.warning(
+                self,
+                "Cámara duplicada",
+                "Ya existe otra cámara guardada con esa URL RTSP.",
+            )
+            return
+        record["ai_enabled"] = original.get("ai_enabled", True)
+        self._cameras[index] = record
+        self._refresh_camera_list(index)
+        self._update_pending_changes()
+        self._set_status(
+            f"Cámara «{record['name']}» editada en el borrador; aplicá los cambios para usarla."
+        )
 
     def remove_camera(self) -> None:
         index = self.camera_list.indexOfTopLevelItem(self.camera_list.currentItem())
