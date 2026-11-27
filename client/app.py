@@ -204,6 +204,85 @@ class CameraRequestWorker(QObject):
             self.finished.emit(None, str(exc))
 
 
+class VideoWindow(QDialog):
+    """Ventana independiente para el video en vivo y sus FPS."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setWindowTitle("VigiWork · Video en vivo")
+        self.setWindowIcon(app_icon())
+        self.setStyleSheet(APP_STYLESHEET)
+        self.setMinimumSize(760, 480)
+        self.resize(1100, 700)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 20)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        title = QLabel("VIDEO EN VIVO")
+        title.setObjectName("eyebrow")
+        header.addWidget(title)
+        header.addStretch()
+        self.fps = QLabel("0 FPS")
+        self.fps.setObjectName("fps")
+        header.addWidget(self.fps)
+        self.fullscreen_button = QPushButton("Pantalla completa")
+        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
+        header.addWidget(self.fullscreen_button)
+        layout.addLayout(header)
+
+        self.video = QLabel("Esperando video del servidor…")
+        self.video.setObjectName("video")
+        self.video.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video.setMinimumSize(640, 360)
+        layout.addWidget(self.video, 1)
+        self.current_frame: QImage | None = None
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+            self.fullscreen_button.setText("Pantalla completa")
+        else:
+            self.showFullScreen()
+            self.fullscreen_button.setText("Salir de pantalla completa")
+        self._fit_frame()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_F11:
+            self.toggle_fullscreen()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            self.fullscreen_button.setText("Pantalla completa")
+            self._fit_frame()
+            return
+        super().keyPressEvent(event)
+
+    def set_frame(self, image: QImage) -> None:
+        self.current_frame = image
+        self._fit_frame()
+
+    def _fit_frame(self) -> None:
+        if self.current_frame is None:
+            return
+        target_width = self.video.contentsRect().width()
+        target_height = self.video.contentsRect().height()
+        if target_width <= 0 or target_height <= 0:
+            return
+        pixmap = QPixmap.fromImage(self.current_frame).scaled(
+            target_width, target_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.video.setPixmap(pixmap)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_frame()
+
+
 class ClientWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -219,6 +298,7 @@ class ClientWindow(QMainWindow):
         self.frames = 0
         self.fps_started = 0.0
         self.current_frame: QImage | None = None
+        self.video_window: VideoWindow | None = None
         self.settings = QSettings("VigiWork", "VigiWorkClient")
         old_settings = QSettings("CiberBoom", "RTSPScoutClient")
         if not self.settings.value("server/address", ""):
@@ -266,20 +346,10 @@ class ClientWindow(QMainWindow):
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        video_header = QHBoxLayout()
-        video_title = QLabel("VIDEO EN VIVO")
-        video_title.setObjectName("eyebrow")
-        video_header.addWidget(video_title)
-        video_header.addStretch()
-        self.fps = QLabel("0 FPS")
-        self.fps.setObjectName("fps")
-        video_header.addWidget(self.fps)
-        layout.addLayout(video_header)
-        self.video = QLabel("Esperando conexión al servidor")
-        self.video.setObjectName("video")
-        self.video.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video.setMinimumSize(320, 240)
-        layout.addWidget(self.video, 1)
+        self.video_hint = QLabel("Elegí una cámara y presioná «Usar cámara» para abrir el video en una ventana independiente.")
+        self.video_hint.setObjectName("subtle")
+        self.video_hint.setWordWrap(True)
+        layout.addWidget(self.video_hint)
         self.setCentralWidget(scrollable(root))
         self.setStyleSheet(APP_STYLESHEET)
 
@@ -301,7 +371,7 @@ class ClientWindow(QMainWindow):
         self.settings.setValue("server/access_key", key)
         self.frames = 0
         self.fps_started = time.monotonic()
-        self.fps.setText("0 FPS")
+        self._set_video_fps("0 FPS")
         self.status.setText("Conectando al servidor…")
         self.disconnect_button.setText("Desconectar del servidor")
         self.disconnect_button.setObjectName("danger")
@@ -373,12 +443,17 @@ class ClientWindow(QMainWindow):
         self.connection_window = None
 
     def _start_preview(self, base_url: str) -> None:
+        self._ensure_video_window()
+        self.video_window.show()
+        self.video_window.raise_()
+        self.video_window.activateWindow()
         if self.thread and self.thread.isRunning():
             return
         self.base_url = base_url
         self.frames = 0
         self.fps_started = time.monotonic()
-        self.fps.setText("0 FPS")
+        self.video_window.video.setText("Conectando al video…")
+        self._set_video_fps("0 FPS")
         self.status.setText("Conectando al video…")
         thread = QThread(self)
         worker = ClientWorker(base_url, self.access_key)
@@ -478,21 +553,22 @@ class ClientWindow(QMainWindow):
         self.frames += 1
         elapsed = time.monotonic() - self.fps_started
         if elapsed >= 1:
-            self.fps.setText(f"{self.frames / elapsed:.1f} FPS")
+            self._set_video_fps(f"{self.frames / elapsed:.1f} FPS")
             self.frames = 0
             self.fps_started = time.monotonic()
 
+    def _ensure_video_window(self) -> None:
+        if self.video_window is None:
+            self.video_window = VideoWindow(self)
+        self.video_window.show()
+
+    def _set_video_fps(self, value: str) -> None:
+        if self.video_window is not None:
+            self.video_window.fps.setText(value)
+
     def _fit_video_frame(self) -> None:
-        if self.current_frame is None:
-            return
-        target_width = self.video.contentsRect().width()
-        if target_width <= 0:
-            return
-        pixmap = QPixmap.fromImage(self.current_frame).scaledToWidth(
-            target_width, Qt.TransformationMode.SmoothTransformation,
-        )
-        self.video.setMinimumHeight(max(240, pixmap.height()))
-        self.video.setPixmap(pixmap)
+        if self.video_window is not None and self.current_frame is not None:
+            self.video_window.set_frame(self.current_frame)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -507,7 +583,7 @@ class ClientWindow(QMainWindow):
         if kind != "live":
             self.frames = 0
             self.fps_started = time.monotonic()
-            self.fps.setText("0 FPS")
+            self._set_video_fps("0 FPS")
 
     def disconnect_server(self) -> bool:
         worker, thread = self.worker, self.thread
@@ -524,11 +600,13 @@ class ClientWindow(QMainWindow):
         self.disconnect_button.setObjectName("primary")
         self.disconnect_button.style().unpolish(self.disconnect_button)
         self.disconnect_button.style().polish(self.disconnect_button)
-        self.video.clear()
-        self.video.setText("Esperando conexión al servidor")
-        self.video.setMinimumHeight(240)
+        if self.video_window is not None:
+            self.video_window.video.clear()
+            self.video_window.video.setText("Esperando conexión al servidor…")
+            self.video_window.video.setMinimumHeight(360)
+            self.video_window.hide()
         self.current_frame = None
-        self.fps.setText("0 FPS")
+        self._set_video_fps("0 FPS")
         self.status.setText("Desconectado")
         self.status.setStyleSheet("")
         return True
