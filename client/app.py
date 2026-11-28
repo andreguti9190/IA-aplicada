@@ -12,11 +12,11 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QObject, QRectF, QSettings, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QImage, QPainter
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QPushButton,
+    QFrame, QLabel, QLineEdit, QMainWindow, QPushButton,
     QVBoxLayout, QWidget,
 )
 
@@ -24,7 +24,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from shared.theme import APP_STYLESHEET, app_icon, brand_header, scrollable
+from shared.theme import APP_STYLESHEET, app_icon, brand_header
+
+
+CLIENT_STYLESHEET = """
+    QWidget#clientRoot { background: #1F1F1F; }
+    QFrame#clientPanel {
+        background: #292929;
+        border: 1px solid #414141;
+        border-radius: 10px;
+    }
+    QLabel#connectionDot { color: #FF7A00; font-size: 16px; }
+    QLabel#clientStatus { background: transparent; border: 0; padding: 0; }
+    QLabel#clientHint { background: transparent; padding: 2px 4px; }
+    QPushButton { min-height: 22px; }
+    QPushButton:focus, QComboBox:focus { border: 1px solid #FF7A00; }
+"""
 
 
 class ServerConfigDialog(QDialog):
@@ -88,7 +103,7 @@ def server_url(value: str) -> str:
 
 
 class ClientWorker(QObject):
-    frame = Signal(QImage)
+    frame_available = Signal()
     status = Signal(str, str)
     finished = Signal()
 
@@ -98,6 +113,24 @@ class ClientWorker(QObject):
         self.access_key = access_key
         self.stopping = threading.Event()
         self.response = None
+        self._frame_lock = threading.Lock()
+        self._latest_frame: QImage | None = None
+        self._frame_signal_pending = False
+
+    def take_latest_frame(self) -> QImage | None:
+        with self._frame_lock:
+            image = self._latest_frame
+            self._latest_frame = None
+            self._frame_signal_pending = False
+            return image
+
+    def _publish_frame(self, image: QImage) -> None:
+        with self._frame_lock:
+            self._latest_frame = image
+            if self._frame_signal_pending:
+                return
+            self._frame_signal_pending = True
+        self.frame_available.emit()
 
     def stop(self) -> None:
         self.stopping.set()
@@ -141,7 +174,7 @@ class ClientWorker(QObject):
                     response.readline()  # CRLF al final de cada parte.
                     image = QImage.fromData(payload, "JPEG")
                     if not image.isNull():
-                        self.frame.emit(image)
+                        self._publish_frame(image)
             finally:
                 self.response = None
 
@@ -204,6 +237,46 @@ class CameraRequestWorker(QObject):
             self.finished.emit(None, str(exc))
 
 
+class VideoSurface(QLabel):
+    """Dibuja el cuadro original ajustado a la ventana sin crear pixmaps por cuadro."""
+
+    def __init__(self, placeholder: str, parent=None):
+        super().__init__(placeholder, parent)
+        self._frame: QImage | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def set_frame(self, image: QImage) -> None:
+        self._frame = image
+        self.setText("")
+        self.update()
+
+    def clear_frame(self, message: str) -> None:
+        self._frame = None
+        self.setText(message)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        image = self._frame
+        if image is None or image.isNull():
+            return
+        area = QRectF(self.contentsRect())
+        if area.width() <= 0 or area.height() <= 0:
+            return
+        scale = min(area.width() / image.width(), area.height() / image.height())
+        width = image.width() * scale
+        height = image.height() * scale
+        target = QRectF(
+            area.x() + (area.width() - width) / 2,
+            area.y() + (area.height() - height) / 2,
+            width,
+            height,
+        )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawImage(target, image)
+
+
 class VideoWindow(QDialog):
     """Ventana independiente para el video en vivo y sus FPS."""
 
@@ -214,8 +287,8 @@ class VideoWindow(QDialog):
         self.setWindowTitle("VigiWork · Video en vivo")
         self.setWindowIcon(app_icon())
         self.setStyleSheet(APP_STYLESHEET)
-        self.setMinimumSize(760, 480)
-        self.resize(1100, 700)
+        self.setMinimumSize(720, 440)
+        self.resize(1120, 700)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 20)
@@ -233,12 +306,10 @@ class VideoWindow(QDialog):
         header.addWidget(self.fullscreen_button)
         layout.addLayout(header)
 
-        self.video = QLabel("Esperando video del servidor…")
+        self.video = VideoSurface("Esperando video del servidor…")
         self.video.setObjectName("video")
-        self.video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video.setMinimumSize(640, 360)
         layout.addWidget(self.video, 1)
-        self.current_frame: QImage | None = None
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -247,7 +318,6 @@ class VideoWindow(QDialog):
         else:
             self.showFullScreen()
             self.fullscreen_button.setText("Salir de pantalla completa")
-        self._fit_frame()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_F11:
@@ -256,31 +326,11 @@ class VideoWindow(QDialog):
         if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
             self.showNormal()
             self.fullscreen_button.setText("Pantalla completa")
-            self._fit_frame()
             return
         super().keyPressEvent(event)
 
     def set_frame(self, image: QImage) -> None:
-        self.current_frame = image
-        self._fit_frame()
-
-    def _fit_frame(self) -> None:
-        if self.current_frame is None:
-            return
-        target_width = self.video.contentsRect().width()
-        target_height = self.video.contentsRect().height()
-        if target_width <= 0 or target_height <= 0:
-            return
-        pixmap = QPixmap.fromImage(self.current_frame).scaled(
-            target_width, target_height,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.video.setPixmap(pixmap)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._fit_frame()
+        self.video.set_frame(image)
 
 
 class ClientWindow(QMainWindow):
@@ -288,7 +338,7 @@ class ClientWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("VigiWork · Cliente")
         self.setWindowIcon(app_icon())
-        self.resize(1100, 700)
+        self.resize(900, 500)
         self.thread: QThread | None = None
         self.worker: ClientWorker | None = None
         self.camera_request_thread: QThread | None = None
@@ -315,43 +365,64 @@ class ClientWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget()
+        root.setObjectName("clientRoot")
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(32, 28, 32, 28)
+        layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(18)
-        layout.addWidget(brand_header("Monitor de cámaras", "Vista en vivo del sistema de seguridad"))
 
-        row = QHBoxLayout()
+        header = QHBoxLayout()
+        header.setSpacing(20)
+        header.addWidget(brand_header("Monitor de cámaras", "Vista en vivo del sistema de seguridad"), 1)
         self.disconnect_button = QPushButton("Desconectar del servidor")
         self.disconnect_button.setObjectName("danger")
         self.disconnect_button.clicked.connect(self.handle_server_button)
-        row.addWidget(self.disconnect_button)
-        row.addStretch()
-        layout.addLayout(row)
+        header.addWidget(self.disconnect_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header)
 
-        cameras_heading = QLabel("CÁMARAS DISPONIBLES")
-        cameras_heading.setObjectName("eyebrow")
-        layout.addWidget(cameras_heading)
+        status_panel = QFrame()
+        status_panel.setObjectName("clientPanel")
+        status_row = QHBoxLayout(status_panel)
+        status_row.setContentsMargins(18, 14, 18, 14)
+        status_row.setSpacing(12)
+        self.status_dot = QLabel("●")
+        self.status_dot.setObjectName("connectionDot")
+        status_row.addWidget(self.status_dot, 0, Qt.AlignmentFlag.AlignTop)
+        self.status = QLabel("Ingresá la dirección que muestra la app servidor.")
+        self.status.setObjectName("clientStatus")
+        self.status.setWordWrap(True)
+        status_row.addWidget(self.status, 1)
+        layout.addWidget(status_panel)
+
+        camera_panel = QFrame()
+        camera_panel.setObjectName("clientPanel")
+        camera_layout = QVBoxLayout(camera_panel)
+        camera_layout.setContentsMargins(20, 18, 20, 20)
+        camera_layout.setSpacing(12)
+        cameras_heading = QLabel("Cámaras disponibles")
+        cameras_heading.setObjectName("pageTitle")
+        camera_layout.addWidget(cameras_heading)
         cameras_row = QHBoxLayout()
+        cameras_row.setSpacing(10)
         self.cameras = QComboBox()
-        self.cameras.setMinimumWidth(160)
+        self.cameras.setMinimumWidth(240)
         cameras_row.addWidget(self.cameras, 1)
-        self.refresh_cameras_button = QPushButton("Actualizar cámaras")
+        self.refresh_cameras_button = QPushButton("Actualizar lista")
         self.refresh_cameras_button.clicked.connect(self.refresh_cameras)
         cameras_row.addWidget(self.refresh_cameras_button)
         self.select_camera_button = QPushButton("Usar cámara")
+        self.select_camera_button.setObjectName("primary")
         self.select_camera_button.clicked.connect(self.select_camera)
         cameras_row.addWidget(self.select_camera_button)
-        layout.addLayout(cameras_row)
-        self.status = QLabel("Ingresá la dirección que muestra la app servidor.")
-        self.status.setObjectName("status")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        camera_layout.addLayout(cameras_row)
+        layout.addWidget(camera_panel)
+
         self.video_hint = QLabel("Elegí una cámara y presioná «Usar cámara» para abrir el video en una ventana independiente.")
-        self.video_hint.setObjectName("subtle")
+        self.video_hint.setObjectName("clientHint")
         self.video_hint.setWordWrap(True)
         layout.addWidget(self.video_hint)
-        self.setCentralWidget(scrollable(root))
-        self.setStyleSheet(APP_STYLESHEET)
+        layout.addStretch(1)
+        self.setCentralWidget(root)
+        self.setStyleSheet(APP_STYLESHEET + CLIENT_STYLESHEET)
 
     def connect_server(self, address: str | None = None, access_key: str | None = None) -> None:
         base_url = server_url(address if address is not None else self.base_url)
@@ -379,7 +450,7 @@ class ClientWindow(QMainWindow):
         worker = ClientWorker(base_url, key)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.frame.connect(self.show_frame)
+        worker.frame_available.connect(self.show_latest_frame)
         worker.status.connect(self.show_status)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -452,14 +523,14 @@ class ClientWindow(QMainWindow):
         self.base_url = base_url
         self.frames = 0
         self.fps_started = time.monotonic()
-        self.video_window.video.setText("Conectando al video…")
+        self.video_window.video.clear_frame("Conectando al video…")
         self._set_video_fps("0 FPS")
         self.status.setText("Conectando al video…")
         thread = QThread(self)
         worker = ClientWorker(base_url, self.access_key)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.frame.connect(self.show_frame)
+        worker.frame_available.connect(self.show_latest_frame)
         worker.status.connect(self.show_status)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -547,7 +618,11 @@ class ClientWindow(QMainWindow):
         self.camera_request_thread = None
         self.camera_request_worker = None
 
-    def show_frame(self, image: QImage) -> None:
+    def show_latest_frame(self) -> None:
+        worker = self.worker
+        image = worker.take_latest_frame() if worker is not None else None
+        if image is None:
+            return
         self.current_frame = image
         self._fit_video_frame()
         self.frames += 1
@@ -578,8 +653,9 @@ class ClientWindow(QMainWindow):
         self.status.setText(message)
         if self.connection_window and self.connection_window.isVisible():
             self.connection_window.set_connection_status(message)
-        color = "#80d7a4" if kind == "live" else "#aeb8dc"
-        self.status.setStyleSheet(f"color:{color}")
+        color = "#80D7A4" if kind == "live" else "#FF7A00"
+        self.status_dot.setStyleSheet(f"color: {color}; background: transparent;")
+        self.status.setStyleSheet("background: transparent; border: 0; padding: 0;")
         if kind != "live":
             self.frames = 0
             self.fps_started = time.monotonic()
@@ -601,14 +677,14 @@ class ClientWindow(QMainWindow):
         self.disconnect_button.style().unpolish(self.disconnect_button)
         self.disconnect_button.style().polish(self.disconnect_button)
         if self.video_window is not None:
-            self.video_window.video.clear()
-            self.video_window.video.setText("Esperando conexión al servidor…")
+            self.video_window.video.clear_frame("Esperando conexión al servidor…")
             self.video_window.video.setMinimumHeight(360)
             self.video_window.hide()
         self.current_frame = None
         self._set_video_fps("0 FPS")
         self.status.setText("Desconectado")
         self.status.setStyleSheet("")
+        self.status_dot.setStyleSheet("color: #777777; background: transparent;")
         return True
 
     def _thread_finished(self) -> None:
